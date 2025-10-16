@@ -217,7 +217,24 @@ app.post('/register', async (req, res) => {
 app.get('/auth/google/callback', async (req, res) => {
   try {
     const { code, state } = req.query;
-    const userData = JSON.parse(state);
+    
+    // Validate parameters
+    if (!code) {
+      throw new Error('Code de vérification manquant');
+    }
+    
+    if (!state) {
+      throw new Error('Données utilisateur manquantes');
+    }
+
+    // Parse user data from state
+    let userData;
+    try {
+      userData = JSON.parse(state);
+    } catch (parseError) {
+      console.error('State parsing error:', state);
+      throw new Error('Format de données invalide');
+    }
 
     // Exchange code for tokens
     const { tokens } = await oauth2Client.getToken(code);
@@ -309,7 +326,73 @@ app.get('/auth/google/callback', async (req, res) => {
 
   } catch (error) {
     console.error('OAuth callback error:', error);
-    res.status(500).send('Erreur lors de l\'authentification');
+    
+    // Error page
+    res.status(500).send(`
+      <!DOCTYPE html>
+      <html lang="fr">
+      <head>
+        <meta charset="UTF-8">
+        <meta name="viewport" content="width=device-width, initial-scale=1.0">
+        <title>Erreur d'authentification</title>
+        <style>
+          body {
+            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            min-height: 100vh;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            padding: 20px;
+          }
+          .container {
+            background: white;
+            padding: 40px;
+            border-radius: 20px;
+            box-shadow: 0 20px 60px rgba(0,0,0,0.3);
+            max-width: 500px;
+            text-align: center;
+          }
+          .error-icon {
+            font-size: 64px;
+            margin-bottom: 20px;
+          }
+          h1 { color: #f44336; margin-bottom: 10px; }
+          p { color: #666; line-height: 1.6; margin-bottom: 20px; }
+          .error-details {
+            background: #f5f5f5;
+            padding: 15px;
+            border-radius: 8px;
+            font-family: monospace;
+            font-size: 14px;
+            color: #666;
+            text-align: left;
+          }
+          a {
+            display: inline-block;
+            margin-top: 20px;
+            padding: 12px 24px;
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            color: white;
+            text-decoration: none;
+            border-radius: 8px;
+            font-weight: 600;
+          }
+        </style>
+      </head>
+      <body>
+        <div class="container">
+          <div class="error-icon">❌</div>
+          <h1>Erreur d'authentification</h1>
+          <p>Une erreur s'est produite lors de la connexion à votre compte Gmail.</p>
+          <div class="error-details">
+            ${error.message || 'Erreur inconnue'}
+          </div>
+          <a href="/">← Réessayer</a>
+        </div>
+      </body>
+      </html>
+    `);
   }
 });
 
