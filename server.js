@@ -548,3 +548,28 @@ app.listen(PORT, () => {
   console.log(`🔑 OAuth configured: ${process.env.GOOGLE_CLIENT_ID ? 'Yes' : 'No'}`);
   console.log(`💾 Supabase configured: ${process.env.SUPABASE_URL ? 'Yes' : 'No'}`);
 });
+
+// Start server with error handling
+const server = app.listen(PORT, () => {
+  console.log(`🚀 Server running on port ${PORT}`);
+  console.log(`📍 Health check: http://localhost:${PORT}/health`);
+  console.log(`🔑 OAuth configured: ${process.env.GOOGLE_CLIENT_ID ? 'Yes' : 'No'}`);
+  console.log(`💾 Supabase configured: ${process.env.SUPABASE_URL ? 'Yes' : 'No'}`);
+});
+
+// Keep the process alive
+process.on('SIGTERM', () => {
+  console.log('SIGTERM signal received: closing HTTP server');
+  server.close(() => {
+    console.log('HTTP server closed');
+  });
+});
+
+// Handle errors
+process.on('uncaughtException', (error) => {
+  console.error('Uncaught Exception:', error);
+});
+
+process.on('unhandledRejection', (error) => {
+  console.error('Unhandled Rejection:', error);
+});
