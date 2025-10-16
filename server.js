@@ -9,7 +9,8 @@ app.use(express.json());
 app.use(express.urlencoded({ extended: true }));
 
 // Configuration
-const PORT = process.env.PORT || 8000;
+// Railway assigns PORT automatically, fallback to 8000 for local dev
+const PORT = parseInt(process.env.PORT) || 8000;
 const SUPABASE_URL = process.env.SUPABASE_URL;
 const SUPABASE_KEY = process.env.SUPABASE_ANON_KEY;
 const N8N_WEBHOOK_URL = process.env.N8N_WEBHOOK_URL;
