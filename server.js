@@ -1,80 +1,31 @@
 const express = require('express');
-const session = require('express-session');
+const { createClient } = require('@supabase/supabase-js');
 const { google } = require('googleapis');
-const { Pool } = require('pg');
-const redis = require('redis');
-const RedisStore = require('connect-redis').default;
-const jwt = require('jsonwebtoken');
 const { v4: uuidv4 } = require('uuid');
 require('dotenv').config();
 
 const app = express();
 const PORT = process.env.PORT || 8080;
 
-// Database Setup
-const pool = new Pool({
-  connectionString: process.env.DATABASE_URL,
-  ssl: { rejectUnauthorized: false }  // Always use SSL for Railway
-});
-
-// Redis Setup
-const redisClient = redis.createClient({
-  url: process.env.REDIS_URL
-});
-redisClient.connect().catch(console.error);
+// Initialize Supabase client
+const supabase = createClient(
+  process.env.SUPABASE_URL,
+  process.env.SUPABASE_ANON_KEY
+);
 
 // Middleware
 app.use(express.json());
 app.use(express.urlencoded({ extended: true }));
 
-// Session Setup
-app.use(session({
-  store: new RedisStore({ client: redisClient }),
-  secret: process.env.SESSION_SECRET || 'dev-secret-change-this',
-  resave: false,
-  saveUninitialized: false,
-  cookie: {
-    secure: process.env.NODE_ENV === 'production',
-    httpOnly: true,
-    maxAge: 1000 * 60 * 60 * 24 // 24 hours
-  }
-}));
+// Simple session storage
+const sessions = {};
 
 // Google OAuth Setup
 const oauth2Client = new google.auth.OAuth2(
   process.env.GOOGLE_CLIENT_ID,
   process.env.GOOGLE_CLIENT_SECRET,
-  process.env.GOOGLE_REDIRECT_URI || `https://${process.env.RAILWAY_PUBLIC_DOMAIN}/auth/google/callback`
+  process.env.GOOGLE_REDIRECT_URI || `https://gmail-registration-agent-production.up.railway.app/auth/google/callback`
 );
-
-// Initialize Database Tables
-async function initDB() {
-  try {
-    await pool.query(`
-      CREATE TABLE IF NOT EXISTS users (
-        id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-        email VARCHAR(255) UNIQUE NOT NULL,
-        name VARCHAR(255),
-        company VARCHAR(255),
-        gmail_address VARCHAR(255),
-        access_token TEXT,
-        refresh_token TEXT,
-        token_expiry TIMESTAMP,
-        watch_expiry TIMESTAMP,
-        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-        updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-      )
-    `);
-    console.log('✅ Database tables initialized');
-  } catch (error) {
-    console.error('Database initialization error:', error);
-  }
-}
-
-// Initialize on startup
-initDB();
-
-// Routes
 
 // Home Page with Registration Form
 app.get('/', (req, res) => {
@@ -83,6 +34,7 @@ app.get('/', (req, res) => {
     <html>
     <head>
       <title>Gmail Agent Registration</title>
+      <meta name="viewport" content="width=device-width, initial-scale=1">
       <style>
         * { margin: 0; padding: 0; box-sizing: border-box; }
         body {
@@ -157,6 +109,9 @@ app.get('/', (req, res) => {
           gap: 10px;
           margin-top: 20px;
         }
+        .google-btn:hover {
+          background: #f8f8f8;
+        }
         .divider {
           text-align: center;
           margin: 20px 0;
@@ -211,18 +166,21 @@ app.get('/', (req, res) => {
 });
 
 // Registration endpoint
-app.post('/register', async (req, res) => {
+app.post('/register', (req, res) => {
   const { name, email, company } = req.body;
   
-  // Store in session for after OAuth
-  req.session.pendingUser = { name, email, company };
+  // Create session
+  const sessionId = uuidv4();
+  sessions[sessionId] = { name, email, company };
   
-  // Redirect to Google OAuth
-  res.redirect('/auth/google');
+  // Redirect to Google OAuth with session ID
+  res.redirect(`/auth/google?session=${sessionId}`);
 });
 
 // Start OAuth flow
 app.get('/auth/google', (req, res) => {
+  const sessionId = req.query.session || uuidv4();
+  
   const scopes = [
     'https://www.googleapis.com/auth/gmail.readonly',
     'https://www.googleapis.com/auth/gmail.send',
@@ -235,7 +193,8 @@ app.get('/auth/google', (req, res) => {
   const url = oauth2Client.generateAuthUrl({
     access_type: 'offline',
     scope: scopes,
-    prompt: 'consent'
+    prompt: 'consent',
+    state: sessionId
   });
 
   res.redirect(url);
@@ -243,7 +202,7 @@ app.get('/auth/google', (req, res) => {
 
 // OAuth callback
 app.get('/auth/google/callback', async (req, res) => {
-  const { code } = req.query;
+  const { code, state } = req.query;
 
   if (!code) {
     return res.status(400).send('Authorization code missing');
@@ -258,33 +217,28 @@ app.get('/auth/google/callback', async (req, res) => {
     const oauth2 = google.oauth2({ version: 'v2', auth: oauth2Client });
     const { data } = await oauth2.userinfo.get();
 
-    // Prepare user data
-    const userData = {
-      email: req.session.pendingUser?.email || data.email,
-      name: req.session.pendingUser?.name || data.name,
-      company: req.session.pendingUser?.company || '',
-      gmail_address: data.email,
-      access_token: tokens.access_token,
-      refresh_token: tokens.refresh_token,
-      token_expiry: new Date(tokens.expiry_date)
-    };
+    // Get session data if exists
+    const sessionData = sessions[state] || {};
+    delete sessions[state];
 
-    // Save to database
-    await pool.query(`
-      INSERT INTO users (email, name, company, gmail_address, access_token, refresh_token, token_expiry)
-      VALUES ($1, $2, $3, $4, $5, $6, $7)
-      ON CONFLICT (email) 
-      DO UPDATE SET 
-        access_token = $5,
-        refresh_token = $6,
-        token_expiry = $7,
-        updated_at = CURRENT_TIMESTAMP
-      RETURNING id
-    `, [userData.email, userData.name, userData.company, userData.gmail_address, 
-        userData.access_token, userData.refresh_token, userData.token_expiry]);
+    // Save to Supabase using API
+    const { data: user, error } = await supabase
+      .from('users')
+      .upsert({
+        email: sessionData.email || data.email,
+        name: sessionData.name || data.name,
+        company: sessionData.company || '',
+        gmail_address: data.email,
+        access_token: tokens.access_token,
+        refresh_token: tokens.refresh_token,
+        token_expiry: new Date(tokens.expiry_date).toISOString()
+      }, {
+        onConflict: 'email'
+      })
+      .select()
+      .single();
 
-    // Clear session
-    req.session.pendingUser = null;
+    if (error) throw error;
 
     // Success page
     res.send(`
@@ -292,6 +246,7 @@ app.get('/auth/google/callback', async (req, res) => {
       <html>
       <head>
         <title>Registration Successful</title>
+        <meta name="viewport" content="width=device-width, initial-scale=1">
         <style>
           body {
             font-family: -apple-system, sans-serif;
@@ -300,6 +255,7 @@ app.get('/auth/google/callback', async (req, res) => {
             display: flex;
             align-items: center;
             justify-content: center;
+            padding: 20px;
           }
           .success-box {
             background: white;
@@ -308,6 +264,7 @@ app.get('/auth/google/callback', async (req, res) => {
             box-shadow: 0 20px 60px rgba(0,0,0,0.3);
             text-align: center;
             max-width: 500px;
+            width: 100%;
           }
           .success-icon {
             width: 80px;
@@ -319,6 +276,7 @@ app.get('/auth/google/callback', async (req, res) => {
             justify-content: center;
             margin: 0 auto 20px;
             font-size: 40px;
+            color: white;
           }
           h1 { color: #333; margin-bottom: 10px; }
           p { color: #666; margin-bottom: 20px; }
@@ -338,6 +296,9 @@ app.get('/auth/google/callback', async (req, res) => {
             font-size: 16px;
             cursor: pointer;
           }
+          button:hover {
+            background: #5a67d8;
+          }
         </style>
       </head>
       <body>
@@ -346,7 +307,7 @@ app.get('/auth/google/callback', async (req, res) => {
           <h1>Registration Successful!</h1>
           <p>Gmail account connected successfully</p>
           <div class="email">${data.email}</div>
-          <p>Your Gmail agent is now active and monitoring your inbox.</p>
+          <p>Your Gmail agent is now active.</p>
           <button onclick="window.location.href='/dashboard'">Go to Dashboard</button>
         </div>
       </body>
@@ -354,33 +315,93 @@ app.get('/auth/google/callback', async (req, res) => {
     `);
 
   } catch (error) {
-    console.error('OAuth error:', error);
-    res.status(500).send('Authentication failed. Please try again.');
+    console.error('OAuth/Database error:', error);
+    res.status(500).send(`
+      <!DOCTYPE html>
+      <html>
+      <head>
+        <title>Registration Failed</title>
+        <style>
+          body {
+            font-family: -apple-system, sans-serif;
+            background: #ef4444;
+            color: white;
+            padding: 20px;
+            text-align: center;
+          }
+          .error-box {
+            max-width: 500px;
+            margin: 50px auto;
+          }
+          button {
+            background: white;
+            color: #ef4444;
+            padding: 12px 30px;
+            border: none;
+            border-radius: 8px;
+            font-size: 16px;
+            cursor: pointer;
+            margin-top: 20px;
+          }
+        </style>
+      </head>
+      <body>
+        <div class="error-box">
+          <h1>Registration Failed</h1>
+          <p>Error: ${error.message}</p>
+          <button onclick="window.location.href='/'">Try Again</button>
+        </div>
+      </body>
+      </html>
+    `);
   }
 });
 
 // Dashboard
 app.get('/dashboard', async (req, res) => {
   try {
-    const result = await pool.query('SELECT COUNT(*) as count FROM users');
-    const userCount = result.rows[0].count;
+    // Get user count
+    const { count } = await supabase
+      .from('users')
+      .select('*', { count: 'exact', head: true });
+
+    // Get recent users
+    const { data: recentUsers } = await supabase
+      .from('users')
+      .select('email, name, company, created_at')
+      .order('created_at', { ascending: false })
+      .limit(5);
+
+    const userRows = recentUsers ? recentUsers.map(user => `
+      <tr>
+        <td style="padding: 12px; border-bottom: 1px solid #e5e7eb;">${user.name || 'N/A'}</td>
+        <td style="padding: 12px; border-bottom: 1px solid #e5e7eb;">${user.email}</td>
+        <td style="padding: 12px; border-bottom: 1px solid #e5e7eb;">${user.company || 'N/A'}</td>
+        <td style="padding: 12px; border-bottom: 1px solid #e5e7eb;">${new Date(user.created_at).toLocaleDateString()}</td>
+      </tr>
+    `).join('') : '';
 
     res.send(`
       <!DOCTYPE html>
       <html>
       <head>
         <title>Dashboard</title>
+        <meta name="viewport" content="width=device-width, initial-scale=1">
         <style>
           body {
             font-family: -apple-system, sans-serif;
             background: #f3f4f6;
             padding: 20px;
+            margin: 0;
           }
           .container {
             max-width: 1200px;
             margin: 0 auto;
           }
-          h1 { color: #333; }
+          h1 { 
+            color: #333; 
+            margin-bottom: 30px;
+          }
           .stats {
             display: grid;
             grid-template-columns: repeat(auto-fit, minmax(250px, 1fr));
@@ -402,6 +423,34 @@ app.get('/dashboard', async (req, res) => {
             color: #666;
             margin-top: 10px;
           }
+          .table-container {
+            background: white;
+            border-radius: 10px;
+            padding: 20px;
+            margin-top: 30px;
+            box-shadow: 0 2px 10px rgba(0,0,0,0.1);
+          }
+          table {
+            width: 100%;
+            border-collapse: collapse;
+          }
+          th {
+            text-align: left;
+            padding: 12px;
+            background: #f9fafb;
+            font-weight: 600;
+            color: #374151;
+            border-bottom: 2px solid #e5e7eb;
+          }
+          .back-link {
+            display: inline-block;
+            margin-top: 20px;
+            color: #667eea;
+            text-decoration: none;
+          }
+          .back-link:hover {
+            text-decoration: underline;
+          }
         </style>
       </head>
       <body>
@@ -409,7 +458,7 @@ app.get('/dashboard', async (req, res) => {
           <h1>Gmail Agent Dashboard</h1>
           <div class="stats">
             <div class="stat-card">
-              <div class="stat-value">${userCount}</div>
+              <div class="stat-value">${count || 0}</div>
               <div class="stat-label">Registered Users</div>
             </div>
             <div class="stat-card">
@@ -417,62 +466,85 @@ app.get('/dashboard', async (req, res) => {
               <div class="stat-label">System Status</div>
             </div>
             <div class="stat-card">
-              <div class="stat-value">${process.uptime().toFixed(0)}s</div>
+              <div class="stat-value">${Math.floor(process.uptime() / 60)}m</div>
               <div class="stat-label">Uptime</div>
             </div>
           </div>
-          <a href="/">← Back to Registration</a>
+          
+          ${count > 0 ? `
+            <div class="table-container">
+              <h2>Recent Registrations</h2>
+              <table>
+                <thead>
+                  <tr>
+                    <th>Name</th>
+                    <th>Email</th>
+                    <th>Company</th>
+                    <th>Registered</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  ${userRows}
+                </tbody>
+              </table>
+            </div>
+          ` : '<p>No users registered yet.</p>'}
+          
+          <a href="/" class="back-link">← Back to Registration</a>
         </div>
       </body>
       </html>
     `);
   } catch (error) {
+    console.error('Dashboard error:', error);
     res.status(500).send('Dashboard error');
+  }
+});
+
+// API endpoint
+app.get('/api/users', async (req, res) => {
+  try {
+    const { data, error } = await supabase
+      .from('users')
+      .select('id, email, name, company, gmail_address, created_at')
+      .order('created_at', { ascending: false });
+
+    if (error) throw error;
+
+    res.json({
+      count: data.length,
+      users: data
+    });
+  } catch (error) {
+    console.error('API error:', error);
+    res.status(500).json({ error: error.message });
   }
 });
 
 // Health check
 app.get('/health', async (req, res) => {
   let dbStatus = 'disconnected';
-  let redisStatus = 'disconnected';
-
+  
   try {
-    await pool.query('SELECT 1');
-    dbStatus = 'connected';
+    const { data, error } = await supabase.from('users').select('count', { count: 'exact', head: true });
+    if (!error) dbStatus = 'connected';
   } catch (error) {
-    console.error('DB health check failed:', error);
-  }
-
-  try {
-    await redisClient.ping();
-    redisStatus = 'connected';
-  } catch (error) {
-    console.error('Redis health check failed:', error);
+    console.error('Health check error:', error);
   }
 
   res.json({
     status: 'healthy',
     timestamp: new Date().toISOString(),
-    services: {
-      database: dbStatus,
-      redis: redisStatus
-    },
+    database: dbStatus,
+    supabase: !!process.env.SUPABASE_URL,
     uptime: process.uptime()
   });
-});
-
-// API endpoint to get all users (for testing)
-app.get('/api/users', async (req, res) => {
-  try {
-    const result = await pool.query('SELECT id, email, name, company, created_at FROM users');
-    res.json(result.rows);
-  } catch (error) {
-    res.status(500).json({ error: 'Database error' });
-  }
 });
 
 // Start server
 app.listen(PORT, () => {
   console.log(`🚀 Server running on port ${PORT}`);
-  console.log(`📍 OAuth Redirect URI: ${process.env.GOOGLE_REDIRECT_URI || 'Not configured'}`);
+  console.log(`📍 Health check: http://localhost:${PORT}/health`);
+  console.log(`🔑 OAuth configured: ${process.env.GOOGLE_CLIENT_ID ? 'Yes' : 'No'}`);
+  console.log(`💾 Supabase configured: ${process.env.SUPABASE_URL ? 'Yes' : 'No'}`);
 });
