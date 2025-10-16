@@ -1,16 +1,56 @@
 require('dotenv').config();
 const express = require('express');
+const path = require('path');
 const { google } = require('googleapis');
 const { createClient } = require('@supabase/supabase-js');
 const axios = require('axios');
+const cors = require('cors');
+const helmet = require('helmet');
 
 const app = express();
+
+// Security middleware
+app.use(helmet());
+
+// CORS configuration
+const corsOptions = {
+  origin: function (origin, callback) {
+    // Allow requests with no origin (like mobile apps or curl requests)
+    if (!origin) return callback(null, true);
+    
+    // Allow Railway preview domains and production domains
+    const allowedOrigins = [
+      process.env.CORS_ORIGIN,
+      process.env.RAILWAY_PUBLIC_DOMAIN,
+      /^https:\/\/.*\.railway\.app$/,
+      /^https:\/\/.*\.up\.railway\.app$/
+    ].filter(Boolean);
+    
+    const isAllowed = allowedOrigins.some(allowedOrigin => {
+      if (typeof allowedOrigin === 'string') {
+        return origin === allowedOrigin;
+      }
+      if (allowedOrigin instanceof RegExp) {
+        return allowedOrigin.test(origin);
+      }
+      return false;
+    });
+    
+    callback(null, isAllowed);
+  },
+  credentials: true
+};
+
+app.use(cors(corsOptions));
 app.use(express.json());
 app.use(express.urlencoded({ extended: true }));
 
+// Serve static files from React build
+app.use(express.static(path.join(__dirname, 'client/build')));
+
 // Configuration
-// Railway assigns PORT automatically, fallback to 8000 for local dev
-const PORT = parseInt(process.env.PORT) || 8000;
+// Railway assigns PORT automatically, fallback to 3001 for local dev
+const PORT = parseInt(process.env.PORT) || 3001;
 const SUPABASE_URL = process.env.SUPABASE_URL;
 const SUPABASE_KEY = process.env.SUPABASE_ANON_KEY;
 const N8N_WEBHOOK_URL = process.env.N8N_WEBHOOK_URL;
@@ -19,10 +59,17 @@ const N8N_WEBHOOK_URL = process.env.N8N_WEBHOOK_URL;
 const supabase = createClient(SUPABASE_URL, SUPABASE_KEY);
 
 // OAuth2 Configuration
+const getRedirectUri = () => {
+  if (process.env.RAILWAY_PUBLIC_DOMAIN) {
+    return `https://${process.env.RAILWAY_PUBLIC_DOMAIN}/auth/google/callback`;
+  }
+  return process.env.GOOGLE_REDIRECT_URI || 'http://localhost:3001/auth/google/callback';
+};
+
 const oauth2Client = new google.auth.OAuth2(
   process.env.GOOGLE_CLIENT_ID,
   process.env.GOOGLE_CLIENT_SECRET,
-  process.env.GOOGLE_REDIRECT_URI
+  getRedirectUri()
 );
 
 const SCOPES = [
@@ -439,6 +486,11 @@ app.get('/api/users', async (req, res) => {
     console.error('Get users error:', error);
     res.status(500).json({ success: false, error: error.message });
   }
+});
+
+// Catch-all handler: send back React's index.html file for client-side routing
+app.get('*', (req, res) => {
+  res.sendFile(path.join(__dirname, 'client/build', 'index.html'));
 });
 
 // ==================== SERVER STARTUP ====================
